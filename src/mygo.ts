@@ -4,6 +4,13 @@ import { call, event } from "mygo-runtime";
 
 // ---- Types ----
 
+export interface PiInstallation {
+  path: string;
+  version: string;
+  status: string;
+  detail: string;
+}
+
 export interface PiRecord {
   generation: number;
   sequence: number;
@@ -42,6 +49,9 @@ export interface Snapshot {
 export const Desktop = {
   chooseProject(): Promise<string> {
     return call("Desktop.ChooseProject");
+  },
+  detectPi(): Promise<PiInstallation> {
+    return call("Desktop.DetectPi");
   },
   getSettings(): Promise<Settings> {
     return call("Desktop.GetSettings");

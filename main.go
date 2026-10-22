@@ -43,7 +43,8 @@ func main() {
 		window = mygo.NewWindow(mygo.WindowOptions{
 			Title: "Pi GUI", URL: "/", Width: 1200, Height: 820,
 			MinWidth: 760, MinHeight: 540, StateKey: "main",
-			BackgroundColor: "light-dark(#f6f8fb, #171e28)",
+			TitleBarStyle:   mygo.TitleBarHiddenInset,
+			BackgroundColor: "light-dark(#f5f4f0, #242421)",
 		})
 		window.OnClosed(func() { window = nil })
 		window.Page().OnWillNavigate(func(e *mygo.NavigateEvent) {

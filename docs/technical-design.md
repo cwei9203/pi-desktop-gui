@@ -8,17 +8,19 @@
 
 | 模块 | 当前实现 |
 | --- | --- |
-| `main.go` | MyGo 窗口、单实例、开发/正式数据隔离、窗口重开与退出流程 |
-| `desktop.go` | 目录选择、Pi 1.4.0 检查、项目与会话管理、模型选择、事件和快照、基础扩展交互 |
+| `main.go` | MyGo 窗口、隐藏嵌入式标题栏、单实例、开发/正式数据隔离、窗口重开与退出流程 |
+| `desktop.go` / `pi_installation.go` | 目录选择、Pi 自动发现与 1.4.0 检查、四种安装状态、项目与会话管理、模型选择、事件和快照、基础扩展交互 |
 | `internal/pi/` | 标准库 RPC 客户端、ID 关联、LF 分帧、超时、清队列与停止、子进程组清理 |
 | `internal/localstate/` | 设置和索引的有界 JSON 读写、私有权限、同目录原子替换与损坏文件保留 |
-| `src/` | React 对话工作台、流式消息状态、工具结果、草稿、明暗主题和生成的 Go 绑定 |
+| `src/` | React 对话工作台、目录选择后直接连接、页面内安装引导与高级设置、流式消息状态、工具结果、草稿、明暗主题和生成的 Go 绑定 |
 
 当前协议记录上限为 32 MiB，发送文字上限为 1 MiB，设置文件上限为 4 MiB。UI 事件带 generation 和 sequence；消息快照记录相应边界，慢窗口通过快照重新同步，避免无界缓存堵住 stdout。
 
 快照补充 transient 数据来恢复尚未完成的消息、活动工具和当前队列。transient 缓存上限为 16 MiB 或 16384 条记录；超过上限时明确报告暂时无法提供完整快照，等待任务结束后再刷新，不将不完整内容伪装为恢复成功。快照读取不与等待扩展输入的 Send 共用阻塞锁；此场景已有回归测试。
 
-当前与完整设计的差距：Git 查询尚未实现；草稿使用 WebView 本地存储；未接入推理级别、用量、命令清单、图片、压缩前历史及索引自动重建；stderr 排空但尚未保留完整诊断日志。正常重启与空闲窗口重开恢复已验证；运行中窗口重开、异常退出恢复和扩展兼容仍需真机验收。实际运行步骤见 [开发指南](development.md)。
+当前与完整设计的差距：Git 查询尚未实现；草稿使用 WebView 本地存储；未接入推理级别、用量、命令清单、图片、压缩前历史及索引自动重建；stderr 排空但尚未保留完整诊断日志。正常重启与空闲窗口重开恢复在本轮连接与视觉调整前已验证；本轮自动化测试、真实自动发现与空路径启动握手、原生直接连接和布局检查也已通过，记录见本文末尾。运行中窗口重开、异常退出恢复和扩展兼容仍需真机验收。实际运行步骤见 [开发指南](development.md)。
+
+当前界面使用暖灰配色、224 px 侧栏、圆角输入区和统一顶部工具栏；MyGo 使用 `TitleBarHiddenInset`，CSS 为窗口控制预留 inset，并将交互控件排除在拖动区域外。布局借鉴 Claude Desktop 官方侧栏与输入区资料，来源见 [产品方案](product-plan.md)；颜色、尺寸与功能为本项目的实现选择，不表示一比一复刻。本轮已查看原生首页/设置截图，标题栏与侧栏无遮挡；不据此推断所有窗口尺寸或原生交互均已通过。
 
 ## 1. 选型与依据
 
@@ -61,14 +63,29 @@ MyGo 的服务调用各自在 goroutine 中执行，进程替换、队列操作�
 
 ### 启动顺序
 
-1. 解析已保存的绝对 Pi 路径；否则通过受控路径查找。macOS 从 Finder 启动时环境与终端不同，需要允许用户选择可执行文件，并验证 npm 安装方式所需的运行时可发现。
-2. 校验项目目录存在且可访问，以真实规范路径标识项目。首次运行检查 Pi 版本；不运行 shell 拼接用户路径。
+1. 页面初始化即探测 Pi，不要求用户确认路径；订阅事件并恢复已有应用快照。普通启动不会仅因记住上次项目就自动发送任务。用户使用系统目录选择器后立即连接，最近项目按钮直接连接，不经过二次连接弹窗。
+2. 校验项目目录存在且可访问，以真实规范路径标识项目；普通连接自动发现 Pi，高级设置提交的非空路径才作为显式覆盖。实际启动前重新探测版本，不运行 shell 拼接用户路径。
 3. 前端先安装事件订阅；Go 再启动 Pi 并持续读取 stdout 和 stderr。事件携带 GUI 进程 generation，旧进程事件不得写入新会话。
 4. 用参数数组启动 `pi --mode rpc --session-dir <GUI项目会话目录>`，设置 CWD；恢复时追加 `--session <已记录的绝对会话路径>`。不使用 `--no-session`。
-5. 按用户在 GUI 中的项目资源选择追加 `--approve` 或 `--no-approve`。显式会话目录同时避免不受信任项目的 sessionDir 设置改变 GUI 的存储位置。
-6. 读取 `get_state`、`get_messages`、模型/推理级别和命令清单；根据 Pi 实际返回更新界面。必须有启动期限和可理解的错误，不等待不存在的 ready 事件。
+5. 普通目录选择和最近项目连接始终传入 `approve=false` 并追加 `--no-approve`。只有用户主动打开页面内「设置 → 高级设置」，勾选当前项目并提交时才传入 true，追加 `--approve`。显式会话目录同时避免不受信任项目的 sessionDir 设置改变 GUI 的存储位置。
+6. 读取 `get_state`、`get_messages` 和模型清单，根据 Pi 实际返回更新界面；完整设计还包括推理级别和命令清单，当前尚未接入。必须有启动期限和可理解的错误，不等待不存在的 ready 事件。
 
-GUI 自己保存的「加载项目资源」选择不修改 Pi 全局 trust.json。`--approve` 允许扩展和配置加载，不代表开启文件系统隔离。Pi 的上下文文件发现与受信任资源发现也不是同一条规则，不能承诺 `--no-approve` 会忽略所有项目内容。
+项目资源批准仅保留在前端本次操作中，不写入 GUI 设置或 Pi 全局 trust.json。前端将批准与当前项目字符串绑定，连接提交后清空；编辑项目、切换项目或重新打开设置也清除旧批准，不能跨项目隐式继承。手动路径覆盖默认空，连接成功清空、失败保留；后端将成功连接使用的 Pi 路径保存为下次自动发现的候选，与项目批准分开。`--approve` 允许扩展和配置加载，不代表开启文件系统隔离。Pi 的上下文文件发现与受信任资源发现也不是同一条规则，不能承诺 `--no-approve` 会忽略所有项目内容。
+
+### Pi 自动发现与安装引导
+
+`DetectPi()` 先读取已保存路径，再枚举 PATH、常见系统安装位置、standalone/npm/Bun 目录和常见 Node 管理器路径。支持通过现有环境变量定位自定义前缀，也检查 nvm、fnm、Volta、asdf、mise、nodenv 等惯用目录；只加入绝对路径，去重并最多保留 128 个候选，不扫描整个用户目录。已保存路径失效或版本不符时继续尝试其他候选，返回可运行的 Pi 1.4.0；没有可用候选时返回有意义的失败状态。
+
+探测通过参数数组执行 `pi --version`，总 context 预算为 5 秒、单候选 1.5 秒，stdout/stderr 分别最多保留 4 KiB；超时终止探测进程组，退出等待延迟设为 250 ms。超量或非版本 stdout 不视为成功。探测不读取或执行 shell 配置，也不拼接 shell 命令；npm 包装脚本仍继承应用环境，发现其文件不代表 Node 一定在 PATH 中。
+
+| 状态 | 含义与界面行为 |
+| --- | --- |
+| `ready` | 可执行文件成功报告 1.4.0；允许连接，RPC 仍需后续握手 |
+| `missing` | 没有找到候选或路径已失效；页面内展示安装引导 |
+| `unsupported` | 得到可识别版本，但与 1.4.0 不符；提示安装兼容版本或选择其他安装 |
+| `unavailable` | 无执行权限、运行失败、超时或版本输出异常；显示原因，提供重试和高级路径入口 |
+
+`PiSetup` 在页面内提供 [官方 v1.4.0 Release](https://github.com/earendil-works/pi/releases/tag/v1.4.0) 外部链接、复制命令 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.4.0`、Node.js 22.19.0+ 要求和重新检测按钮。官方 Release 由系统浏览器打开，用户选择系统/架构对应包；GUI 不下载、执行安装脚本或办理认证。重新检测只刷新状态，安装就绪后用户选择或继续项目。检测结果与 RPC 连接状态分开，`ready` 不证明模型认证可用。
 
 ### 单活跃进程策略
 
@@ -163,13 +180,17 @@ Go 绑定暴露所需操作并校验项目/会话归属、参数和路径。Git 
 | [Pi 事件](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/docs/json.md)、[扩展 UI](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/docs/rpc-extension-ui.md) | 流式重建、完成语义、工具事件、对话框与 TUI 限制 |
 | [Pi CLI](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/docs/cli.md)、[会话格式](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/docs/session-format.md) | 启动参数、目录、持久文件与恢复 |
 | [Pi 安全与信任](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/docs/security.md)、[包声明](https://github.com/earendil-works/pi/blob/58c0b02ce552adab76014e7ed712ab7981359aa8/packages/coding-agent/package.json) | 项目信任、操作系统权限、运行时要求 |
+| [Pi Quickstart](https://pi.dev/docs/latest/quickstart)、[v1.4.0 Release](https://github.com/earendil-works/pi/releases/tag/v1.4.0)、[v1.4.0 包声明](https://github.com/earendil-works/pi/blob/v1.4.0/packages/coding-agent/package.json) | 官方安装入口、`--ignore-scripts`、固定版本包名与 Node.js 22.19.0+ 要求；GUI 在官方 npm 命令上添加 `@1.4.0` |
+| [Claude Desktop 改版说明](https://claude.com/resources/articles/claude-code-desktop-redesign)、[预览与审查文章](https://claude.com/resources/articles/preview-review-and-merge-with-claude-code) | 侧栏和工作区结构、局部输入区与 Diff 视觉参考；不作为本项目功能或精确样式承诺 |
 
-已获得的本机证据：macOS Apple Silicon 构建生成约 9.4 MB `.app` 与约 2.8 MB DMG；Pi 1.4.0 RPC 握手返回会话状态与 49 个模型。桌面应用使用 Deepseek-V4.1-Flash 完成一次真实只读任务，观察到 `read` 工具读取隔离临时项目的 `sample.txt`，并正确展示两行中英文内容。
+本次连接与视觉调整前已获得的本机证据：macOS Apple Silicon 构建生成约 9.4 MB `.app` 与约 2.8 MB DMG；Pi 1.4.0 RPC 握手返回会话状态与 49 个模型。桌面应用使用 Deepseek-V4.1-Flash 完成一次真实只读任务，观察到 `read` 工具读取隔离临时项目的 `sample.txt`，并正确展示两行中英文内容。
 
-测试文件内容断言完全未变，会话工具调用记录仅有 `read`，没有 `bash`、`edit` 或 `write`。正常 `Cmd+Q` 退出成功，随后 `ps` 检查无该 GUI 与其 Pi RPC 进程残留；最新版 `bun run build` 再次成功。
+测试文件内容断言完全未变，会话工具调用记录仅有 `read`，没有 `bash`、`edit` 或 `write`。正常 `Cmd+Q` 退出成功，随后 `ps` 检查无该 GUI 与其 Pi RPC 进程残留；调整前 `bun run build` 成功。
 
-最新原生应用完成正常重启恢复验证：彻底退出后重启并连接同一项目，用户消息、`read` 工具结果和完整回复均恢复，没有自动发送。空闲时关闭窗口再创建新窗口，连接、历史和未发送中文草稿均保留；测试草稿已清除。该结果仅覆盖空闲状态，不代表运行中窗口重开或停止通过。
+调整前原生应用完成正常重启恢复验证：彻底退出后重启并连接同一项目，用户消息、`read` 工具结果和完整回复均恢复，没有自动发送。空闲时关闭窗口再创建新窗口，连接、历史和未发送中文草稿均保留；测试草稿已清除。该结果仅覆盖空闲状态，不代表运行中窗口重开或停止通过。
 
-`go test -race ./...`、`go vet ./...`、`bun test src` 和 `bun run build:web` 已通过。验证覆盖协议、状态与存储边界；运行中真实工具停止/恢复和完整原生交互仍未完成验收。
+本轮新增 Pi 自动发现、直接连接、页面内安装引导、高级授权和标题栏后，`go test -race ./...`、`go vet ./...`、`bun test src`（11 项、56 个断言）和 `bun run build` 均通过；产物约 9.4 MB `.app` 与约 2.8 MB DMG。真实 `DetectPi` 加空路径 `Start` 握手识别 Pi 1.4.0，返回 49 个模型。本轮未发起新的模型 prompt。
+
+原生桌面确认自动发现无需手填路径，系统目录选择后直接连接并恢复历史，没有二次配置弹窗；最近项目点击直接开始连接。设置位于主区域，高级默认折叠，原生首页/设置截图中的暖灰侧栏和统一标题栏无遮挡。`missing`、`unsupported`、`unavailable` 由隔离 fixture 与组件渲染测试覆盖；没有实际安装或卸载 Pi，也未手动验收深色主题和中文 IME。安装后重试、手动路径覆盖与跨项目批准隔离的完整人工流程仍待补充。
 
 仍需实测：MyGo 对手动中文 IME/剪贴板图片/键盘焦点的表现；运行中的事件订阅与窗口重开；长对话内存；Finder 启动时 Pi 环境；真实扩展阻塞时的停止；运行中真实工具子进程退出；打包产物的完整操作流程。保留中文草稿不等于中文 IME 组合输入验收。当前无性能或生产稳定性结论。

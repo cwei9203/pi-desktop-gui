@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -80,18 +79,6 @@ func newDesktop(dir string) (*Desktop, error) {
 	if err != nil {
 		return nil, err
 	}
-	if data.PiPath == "" {
-		data.PiPath, _ = exec.LookPath("pi")
-		if data.PiPath == "" {
-			home, _ := os.UserHomeDir()
-			for _, path := range []string{filepath.Join(home, ".local/bin/pi"), "/opt/homebrew/bin/pi", "/usr/local/bin/pi"} {
-				if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-					data.PiPath = path
-					break
-				}
-			}
-		}
-	}
 	return &Desktop{dir: dir, data: data, pending: make(map[string]map[string]any), wake: make(chan struct{}, 1)}, nil
 }
 
@@ -137,25 +124,18 @@ func (d *Desktop) Start(project, executable string, approve bool) (Snapshot, err
 	if info, err := os.Stat(project); err != nil || !info.IsDir() {
 		return Snapshot{}, errors.New("请选择有效的项目目录")
 	}
-	if strings.TrimSpace(executable) == "" {
-		return Snapshot{}, errors.New("请填写 Pi 可执行文件路径")
-	}
-	executable, err = exec.LookPath(executable)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("找不到 Pi: %w", err)
-	}
-	if !filepath.IsAbs(executable) {
-		return Snapshot{}, errors.New("Pi 必须使用绝对路径")
-	}
+	var installation PiInstallation
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	version, err := exec.CommandContext(ctx, executable, "--version").Output()
-	if err != nil {
-		return Snapshot{}, errors.New("无法读取 Pi 版本，请检查可执行文件和运行环境")
+	if strings.TrimSpace(executable) == "" {
+		installation = d.DetectPi()
+	} else {
+		installation = probePi(ctx, executable)
 	}
-	if strings.TrimSpace(string(version)) != "1.4.0" {
-		return Snapshot{}, fmt.Errorf("当前仅验证 Pi 1.4.0；检测到 %s", strings.TrimSpace(string(version)))
+	if installation.Status != "ready" {
+		return Snapshot{}, errors.New(installation.Detail)
 	}
+	executable = installation.Path
 	sessionDir := d.sessionDir(project)
 	if err := os.MkdirAll(sessionDir, 0700); err != nil {
 		return Snapshot{}, err

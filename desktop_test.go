@@ -200,14 +200,19 @@ func TestDesktopRealPiConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.disconnect() })
-	snapshot, err := d.Start(t.TempDir(), executable, false)
+	d.data.PiPath = executable
+	installation := d.DetectPi()
+	if installation.Status != "ready" || installation.Path != executable {
+		t.Fatalf("Pi auto-detection failed: %+v", installation)
+	}
+	snapshot, err := d.Start(t.TempDir(), "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !snapshot.Connected || snapshot.State["sessionFile"] == nil {
 		t.Fatal("Pi did not return a persistent session")
 	}
-	t.Logf("Pi RPC connected; %d models available", len(snapshot.Models))
+	t.Logf("Pi %s auto-detected and RPC connected; %d models available", installation.Version, len(snapshot.Models))
 }
 
 func TestDesktopTransientSnapshotBoundary(t *testing.T) {

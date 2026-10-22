@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { isMyGo } from "mygo-runtime";
 import ReactMarkdown from "react-markdown";
-import { ArrowDown, ArrowUp, Check, ChevronDown, Copy, FolderOpen, MessageSquare, PanelLeft, Plus, Settings2, Square, Terminal, X } from "lucide-react";
-import { Desktop, events } from "./mygo";
+import { ArrowDown, ArrowUp, Check, ChevronDown, Copy, FolderOpen, MessageSquare, PanelLeft, Plus, RefreshCw, Settings2, Square, Terminal, X } from "lucide-react";
+import { Desktop, events, type PiInstallation } from "./mygo";
+import { PiSetup, PI_INSTALL_URL } from "./PiSetup";
 import { acceptEnvelope, conversationFromSnapshot, object, receiveRecord, recoverQueueDraft, strings, text, type ChatMessage, type ContentBlock, type Conversation, type Envelope, type EnvelopeResult, type RecordValue, type ToolRun } from "./session";
 
 type Snapshot = Awaited<ReturnType<typeof Desktop.snapshot>>;
@@ -105,7 +106,9 @@ export default function App() {
   const [projects, setProjects] = useState<string[]>([]);
   const [project, setProject] = useState("");
   const [piPath, setPiPath] = useState("");
-  const [approve, setApprove] = useState(false);
+  const [approvedProject, setApprovedProject] = useState("");
+  const [installation, setInstallation] = useState<PiInstallation | null>(null);
+  const [detecting, setDetecting] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [busy, setBusy] = useState("");
@@ -208,9 +211,9 @@ export default function App() {
     });
     void (async () => {
       try {
-        const settings = await Desktop.getSettings();
+        const [settings, detected] = await Promise.all([Desktop.getSettings(), Desktop.detectPi().catch((cause: unknown): PiInstallation => ({ path: "", version: "", status: "unavailable", detail: errorText(cause) }))]);
         if (!mounted) return;
-        setDesktopReady(true); setPiPath(settings.piPath); setProjects(settings.projects ?? []);
+        setDesktopReady(true); setProjects(settings.projects ?? []); setInstallation(detected);
         const current = await Desktop.snapshot();
         if (!mounted) return;
         installSnapshot(current);
@@ -260,18 +263,35 @@ export default function App() {
     } finally { setBusy(""); }
   }
 
-  async function chooseProject() {
-    try { const path = await Desktop.chooseProject(); if (path) { setProject(path); setApprove(false); setSettingsOpen(true); } }
+  async function chooseProject(editSettings = false) {
+    try {
+      const path = await Desktop.chooseProject();
+      if (!path) return;
+      if (editSettings) { setProject(path); setApprovedProject(""); }
+      else await connect(path);
+    }
     catch (cause) { setError(errorText(cause)); }
   }
 
-  async function connect() {
-    const success = await loadSnapshot("正在连接", () => Desktop.start(project, piPath, approve));
+  async function detectPi() {
+    setDetecting(true);
+    try { const detected = await Desktop.detectPi(); setInstallation(detected); return detected; }
+    catch (cause) { setInstallation({ path: "", version: "", status: "unavailable", detail: errorText(cause) }); return null; }
+    finally { setDetecting(false); }
+  }
+
+  async function connect(target = project, advanced = false) {
+    if (!target || running || isBusy) return;
+    const approval = advanced && approvedProject === target;
+    setProject(target); setApprovedProject("");
+    const success = await loadSnapshot("正在连接", () => Desktop.start(target, advanced ? piPath : "", approval));
     if (success) {
       setSettingsOpen(false); setSidebarOpen(false);
-      try { const settings = await Desktop.getSettings(); setProjects(settings.projects ?? []); setPiPath(settings.piPath); }
+      setPiPath("");
+      try { const settings = await Desktop.getSettings(); setProjects(settings.projects ?? []); }
       catch (cause) { setError(errorText(cause)); }
-    }
+    } else setProject(target);
+    await detectPi();
   }
 
   async function send() {
@@ -300,46 +320,57 @@ export default function App() {
   const status = busy || (pending ? "等待你的输入" : connected ? conversation.phase : "未连接");
   const currentError = error || conversation.error;
 
+  const showSetup = desktopReady && !connected && installation && installation.status !== "ready";
+  const empty = conversation.messages.length === 0;
+  const piLabel = installation?.status === "ready" ? `已发现 Pi${installation.version ? ` ${installation.version}` : ""}` : installation?.status === "missing" ? "尚未安装 Pi" : installation?.status === "unsupported" ? "Pi 版本不兼容" : installation?.status === "unavailable" ? "Pi 暂不可用" : desktopReady ? "正在检测 Pi" : "本机 Pi";
+  const openInstall = () => { void Desktop.openExternal(PI_INSTALL_URL).catch((cause: unknown) => setError(errorText(cause))); };
+
   return <div className={`app-shell${sidebarOpen ? " sidebar-open" : ""}`}>
     <aside className="sidebar">
+      <div className="sidebar-drag-region" />
       <div className="brand"><span className="brand-mark">π</span><span>Pi <strong>工作台</strong></span><button className="icon-button mobile-only" aria-label="收起侧栏" onClick={() => setSidebarOpen(false)}><X size={17} /></button></div>
-      <button className="project-button" onClick={() => void chooseProject()} disabled={!desktopReady || running || isBusy}><FolderOpen size={17} /><span><strong>{basename(snapshot?.project || project)}</strong><small>{snapshot?.project || project || "打开本地文件夹"}</small></span><ChevronDown size={14} /></button>
-      {projects.length > 1 && <select className="recent-projects" aria-label="最近项目" value={snapshot?.project || project} disabled={running || isBusy} onChange={(event) => { setProject(event.target.value); setApprove(false); setSettingsOpen(true); }}><option value="">最近项目</option>{projects.map((path) => <option key={path} value={path}>{basename(path)}</option>)}</select>}
-      <div className="section-heading"><span>会话</span><button className="icon-button" aria-label="新建会话" title="新建会话" disabled={!connected || running || isBusy} onClick={() => void loadSnapshot("正在新建", () => Desktop.newSession())}><Plus size={17} /></button></div>
-      <nav className="sessions" aria-label="项目会话">{snapshot?.sessions?.length ? snapshot.sessions.map((session) => <button key={session.path} className={`session-button${session.path === sessionPath ? " selected" : ""}`} disabled={running || isBusy} onClick={() => { void loadSnapshot("正在恢复", () => Desktop.resume(session.path)); setSidebarOpen(false); }}><MessageSquare size={15} /><span><strong>{session.name || "未命名会话"}</strong><small>{session.updated ? new Date(session.updated).toLocaleDateString("zh-CN", { month: "short", day: "numeric" }) : "新会话"}</small></span></button>) : <p className="sidebar-empty">{connected ? "发送第一条消息后，\n会话会保存在这里。" : "连接项目后，\n在这里继续你的会话。"}</p>}</nav>
-      <div className="sidebar-footer"><button className="settings-button" disabled={running || isBusy || !desktopReady} onClick={() => setSettingsOpen(true)}><Settings2 size={16} />连接设置</button><span className="local-label"><span className={`status-dot${connected ? " online" : ""}`} />本机 Pi</span></div>
+      <button className="new-session-button" disabled={!connected || running || isBusy} onClick={() => { void loadSnapshot("正在新建", () => Desktop.newSession()); setSettingsOpen(false); }}><Plus size={17} />新对话</button>
+      <button className="project-button" title={snapshot?.project || project || "选择本地项目"} onClick={() => void chooseProject()} disabled={!desktopReady || running || isBusy}><FolderOpen size={16} /><span><strong>{basename(snapshot?.project || project)}</strong><small>{snapshot?.project || project || "打开本地文件夹"}</small></span><ChevronDown size={13} /></button>
+      {projects.length > 0 && <details className="recent-projects"><summary>最近项目<ChevronDown size={12} /></summary><div>{projects.map((path) => <button type="button" key={path} title={path} disabled={running || isBusy || !desktopReady} onClick={() => void connect(path)}><FolderOpen size={13} /><span>{basename(path)}</span></button>)}</div></details>}
+      <div className="section-heading"><span>最近对话</span><span>{snapshot?.sessions?.length || ""}</span></div>
+      <nav className="sessions" aria-label="项目会话">{snapshot?.sessions?.length ? snapshot.sessions.map((session) => <button key={session.path} title={session.name || "未命名会话"} className={`session-button${session.path === sessionPath ? " selected" : ""}`} disabled={!connected || running || isBusy} onClick={() => { void loadSnapshot("正在恢复", () => Desktop.resume(session.path)); setSidebarOpen(false); setSettingsOpen(false); }}><MessageSquare size={14} /><span><strong>{session.name || "未命名会话"}</strong><small>{session.updated ? new Date(session.updated).toLocaleDateString("zh-CN", { month: "short", day: "numeric" }) : "新会话"}</small></span></button>) : <p className="sidebar-empty">{connected ? "第一条消息后，\n对话会保存在这里。" : "选择项目后，\n继续之前的对话。"}</p>}</nav>
+      <div className="sidebar-footer"><button className={`settings-button${settingsOpen ? " selected" : ""}`} disabled={running || isBusy || !desktopReady} onClick={() => { setApprovedProject(""); setSettingsOpen((current) => !current); }}><Settings2 size={16} />设置</button><span className="local-label" title={installation?.path}><span className={`status-dot${installation?.status === "ready" ? " online" : ""}`} />{piLabel}</span></div>
     </aside>
 
-    <main className="workspace">
-      <header className="toolbar"><button className="icon-button mobile-only" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}><PanelLeft size={18} /></button><div className="conversation-title"><strong>{sessionName}</strong><span className="run-status" role="status"><span className={`status-dot${running ? " working" : connected ? " online" : ""}`} />{status}</span></div>
-        {connected && <select className="model-select" aria-label="选择模型" disabled={running || isBusy || !snapshot?.models?.length} value={`${text(model.provider)}/${text(model.id)}`} onChange={(event) => { const selected = snapshot?.models.map(object).find((candidate) => `${text(candidate.provider)}/${text(candidate.id)}` === event.target.value); if (selected) void loadSnapshot("正在切换模型", () => Desktop.setModel(text(selected.provider), text(selected.id))); }}><option value={`${text(model.provider)}/${text(model.id)}`}>{text(model.name) || text(model.id) || "未选择模型"}</option>{snapshot?.models.map(object).filter((candidate) => candidate.id !== model.id || candidate.provider !== model.provider).map((candidate) => <option key={`${text(candidate.provider)}/${text(candidate.id)}`} value={`${text(candidate.provider)}/${text(candidate.id)}`}>{text(candidate.name) || text(candidate.id)}</option>)}</select>}
-      </header>
+    <main className={`workspace${empty && !settingsOpen && !showSetup ? " workspace-empty" : ""}`}>
+      <header className="toolbar"><button className="icon-button mobile-only" aria-label="打开侧栏" onClick={() => setSidebarOpen(true)}><PanelLeft size={18} /></button><div className="conversation-title"><strong>{settingsOpen ? "设置" : connected ? sessionName : "Pi 工作台"}</strong>{connected && !settingsOpen && <span>{basename(snapshot?.project || "")}</span>}</div><span className="run-status" role="status"><span className={`status-dot${running ? " working" : connected ? " online" : ""}`} />{status}</span></header>
 
       {currentError && <div className="error-banner" role="alert"><span>{currentError}</span>{needsSync && <button className="text-link" disabled={isBusy} onClick={() => void loadSnapshot("正在同步", () => Desktop.snapshot())}>刷新状态</button>}<button className="icon-button" aria-label="关闭错误提示" onClick={() => { setError(""); setConversation((current) => ({ ...current, error: "" })); }}><X size={15} /></button></div>}
       {conversation.notice && <div className="notice-banner"><span>{conversation.notice}</span><button className="icon-button" aria-label="关闭通知" onClick={() => setConversation((current) => ({ ...current, notice: "" }))}><X size={14} /></button></div>}
 
-      <div className="conversation-scroll" ref={scroller} onScroll={(event) => { const element = event.currentTarget; followBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; if (followBottom.current) setNewContent(false); }}>
-        {conversation.messages.length ? <div className="messages">{conversation.messages.map((message, index) => <Message key={`${snapshot?.generation}/${sessionPath}/${index}`} message={message} tools={conversation.tools} onError={setError} />)}</div>
-          : <div className="empty-conversation"><div className="empty-mark">π</div><h1>{connected ? "从一个具体任务开始" : "给你的项目一个工作台"}</h1><p>{connected ? "描述要改的代码，或让 Pi 先读一遍项目。\n执行过程和工具输出会显示在这里。" : "连接本机 Pi，在这里阅读、编写和继续工作。\n会话留在本机，模型配置沿用 Pi。"}</p>{!connected && <button className="primary-button" disabled={!desktopReady || isBusy} onClick={() => { if (project) setSettingsOpen(true); else void chooseProject(); }}><FolderOpen size={16} />{project ? "连接项目" : "选择项目"}</button>}</div>}
-      </div>
+      {settingsOpen ? <div className="settings-scroll"><section className="settings-panel">
+        <div className="settings-heading"><div><h1>让 Pi 在本机工作</h1><p>模型与账号沿用 Pi 的配置，项目选择后直接连接。</p></div><button className="icon-button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div>
+        <div className="installation-row"><div><strong><span className={`status-dot${installation?.status === "ready" ? " online" : ""}`} />{piLabel}</strong><small>{installation?.path || installation?.detail || "正在查找本机安装"}</small></div><button className="subtle-button" type="button" disabled={detecting || isBusy} onClick={() => void detectPi()}><RefreshCw size={13} />{detecting ? "检测中…" : "重新检测"}</button></div>
+        {installation && installation.status !== "ready" && <PiSetup installation={installation} detecting={detecting} onDetect={() => void detectPi()} onOpenInstall={openInstall} />}
+        <form onSubmit={(event) => { event.preventDefault(); void connect(project, true); }}>
+          <label className="field"><span>当前项目</span><div className="path-input"><input value={project} onChange={(event) => { setProject(event.target.value); setApprovedProject(""); }} placeholder="选择本地文件夹" /><button className="subtle-button" type="button" disabled={isBusy} onClick={() => void chooseProject(true)}><FolderOpen size={14} />选择</button></div></label>
+          <details className="advanced-settings"><summary>高级设置<ChevronDown size={14} /></summary>
+            <label className="field"><span>手动指定 Pi 路径</span><input value={piPath} onChange={(event) => setPiPath(event.target.value)} placeholder="留空，自动检测" spellCheck={false} /><small>一般无需填写。仅在自动检测未找到自定义安装时使用。</small></label>
+            <label className="checkbox-field"><input type="checkbox" checked={!!project && approvedProject === project} onChange={(event) => setApprovedProject(event.target.checked ? project : "")} disabled={!project} /><span>加载当前项目的扩展、技能和配置<small>默认关闭。本次授权仅用于连接这个项目，切换项目后需重新启用。Pi 可访问项目之外的文件。</small></span></label>
+          </details>
+          <div className="settings-actions"><button className="primary-button" disabled={isBusy || !project}>{busy || "应用并连接项目"}</button></div>
+        </form>
+      </section></div> : <>
+        <div className="conversation-scroll" ref={scroller} onScroll={(event) => { const element = event.currentTarget; followBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; if (followBottom.current) setNewContent(false); }}>
+          {showSetup ? <div className="setup-page"><PiSetup installation={installation} detecting={detecting} onDetect={() => void detectPi()} onOpenInstall={openInstall} /></div> : !empty ? <div className="messages">{conversation.messages.map((message, index) => <Message key={`${snapshot?.generation}/${sessionPath}/${index}`} message={message} tools={conversation.tools} onError={setError} />)}</div>
+            : <div className="empty-conversation"><span className="empty-mark" aria-hidden="true">π</span><h1>{connected ? "今天想做些什么？" : "从一个项目开始"}</h1><p>{connected ? `与 Pi 一起，在 ${basename(snapshot?.project || "")} 中继续工作。` : "选择本地文件夹，让 Pi 阅读、修改和运行代码。"}</p>{!connected && <div className="empty-actions"><button className="primary-button" disabled={!desktopReady || isBusy} onClick={() => void chooseProject()}><FolderOpen size={15} />选择项目</button>{project && <button className="subtle-button" disabled={!desktopReady || isBusy} onClick={() => void connect(project)}>继续 {basename(project)}</button>}</div>}</div>}
+        </div>
 
-      <div className="composer-area">{newContent && <button className="new-content" onClick={() => { followBottom.current = true; scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); setNewContent(false); }}><ArrowDown size={14} />查看新内容</button>}
-        {queueCount > 0 && <details className="queue"><summary>{queueCount} 条待执行指令</summary>{conversation.queue.steering.map((message, index) => <p key={`s${index}`}><span>追加</span>{message}</p>)}{conversation.queue.followUp.map((message, index) => <p key={`f${index}`}><span>后续</span>{message}</p>)}</details>}
-        <form className="composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
-          <textarea ref={input} aria-label="发给 Pi 的消息" placeholder={connected ? "告诉 Pi，你想完成什么…" : "先连接一个项目"} value={draft} disabled={!connected || isBusy || needsSync} rows={3} onChange={(event) => changeDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} />
-          <div className="composer-controls"><span className="composer-hint">⌘ Enter 发送 <span>Enter 换行</span></span><div className="send-controls">{(running || busy === "正在发送") && <><select className="behavior-select" aria-label="运行中消息处理方式" value={behavior} onChange={(event) => setBehavior(event.target.value)} disabled={isBusy}><option value="steer">追加指令</option><option value="followUp">完成后执行</option></select><button type="button" className="stop-button" onClick={() => void stop()} disabled={busy === "正在停止"}><Square size={12} fill="currentColor" />停止</button></>}<button className="send-button" type="submit" aria-label={running ? behavior === "steer" ? "追加指令" : "排队消息" : "发送消息"} disabled={!connected || !draft.trim() || isBusy || needsSync}><ArrowUp size={18} /></button></div></div>
-        </form><p className="composer-footnote">{connected ? `${basename(snapshot?.project || "")} 中的工作由本机 Pi 执行` : "连接后可发送消息；未发送的草稿保存在本机"}</p>
-      </div>
+        {!showSetup && <div className="composer-area">{newContent && <button className="new-content" onClick={() => { followBottom.current = true; scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); setNewContent(false); }}><ArrowDown size={14} />查看新内容</button>}
+          {queueCount > 0 && <details className="queue"><summary>{queueCount} 条待执行指令</summary>{conversation.queue.steering.map((message, index) => <p key={`s${index}`}><span>追加</span>{message}</p>)}{conversation.queue.followUp.map((message, index) => <p key={`f${index}`}><span>后续</span>{message}</p>)}</details>}
+          <form className="composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
+            <textarea ref={input} aria-label="发给 Pi 的消息" placeholder={connected ? "描述任务，或向 Pi 提问…" : "选择项目后，在这里开始对话"} value={draft} disabled={!connected || isBusy || needsSync} rows={3} onChange={(event) => changeDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }} />
+            <div className="composer-controls"><div className="composer-options">{connected ? <select className="model-select" aria-label="选择模型" disabled={running || isBusy || !snapshot?.models?.length} value={`${text(model.provider)}/${text(model.id)}`} onChange={(event) => { const selected = snapshot?.models.map(object).find((candidate) => `${text(candidate.provider)}/${text(candidate.id)}` === event.target.value); if (selected) void loadSnapshot("正在切换模型", () => Desktop.setModel(text(selected.provider), text(selected.id))); }}><option value={`${text(model.provider)}/${text(model.id)}`}>{text(model.name) || text(model.id) || "选择模型"}</option>{snapshot?.models.map(object).filter((candidate) => candidate.id !== model.id || candidate.provider !== model.provider).map((candidate) => <option key={`${text(candidate.provider)}/${text(candidate.id)}`} value={`${text(candidate.provider)}/${text(candidate.id)}`}>{text(candidate.name) || text(candidate.id)}</option>)}</select> : <span className="composer-hint">本机执行</span>}</div><div className="send-controls">{(running || busy === "正在发送") && <><select className="behavior-select" aria-label="运行中消息处理方式" value={behavior} onChange={(event) => setBehavior(event.target.value)} disabled={isBusy}><option value="steer">追加指令</option><option value="followUp">完成后执行</option></select><button type="button" className="stop-button" onClick={() => void stop()} disabled={busy === "正在停止"}><Square size={12} fill="currentColor" />停止</button></>}<button className="send-button" type="submit" aria-label={running ? behavior === "steer" ? "追加指令" : "排队消息" : "发送消息"} disabled={!connected || !draft.trim() || isBusy || needsSync}><ArrowUp size={18} /></button></div></div>
+          </form><p className="composer-footnote">{connected ? "⌘ Enter 发送，Enter 换行。草稿自动保存在本机。" : "会话留在本机，模型配置沿用 Pi。"}</p>
+        </div>}
+      </>}
     </main>
 
-    {settingsOpen && <Modal title="连接本机 Pi" onDismiss={() => { if (!isBusy) setSettingsOpen(false); }}><form onSubmit={(event) => { event.preventDefault(); void connect(); }}>
-      <p className="dialog-description">选择项目和 Pi 程序。模型账号继续使用 Pi 的现有配置。</p>
-      {currentError && <p role="alert" className="message-error">{currentError}</p>}
-      <label className="field"><span>项目目录</span><div className="path-input"><input required value={project} onChange={(event) => { setProject(event.target.value); setApprove(false); }} placeholder="/path/to/project" /><button className="subtle-button" type="button" disabled={isBusy} onClick={() => void chooseProject()}>选择</button></div></label>
-      <label className="field"><span>Pi 程序路径</span><input required value={piPath} onChange={(event) => setPiPath(event.target.value)} placeholder="/path/to/pi" spellCheck={false} /><small>在终端执行 command -v pi 可查看路径。</small></label>
-      <label className="checkbox-field"><input type="checkbox" checked={approve} onChange={(event) => setApprove(event.target.checked)} /><span>加载此项目的扩展、技能和配置<small>仅对你信任的项目启用。Pi 的文件访问不受项目目录限制。</small></span></label>
-      <div className="modal-actions"><button className="subtle-button" type="button" disabled={isBusy} onClick={() => setSettingsOpen(false)}>取消</button><button className="primary-button" disabled={isBusy || !project || !piPath}>{busy || "连接项目"}</button></div>
-    </form></Modal>}
-    {pending && !settingsOpen && <ExtensionDialog key={text(pending.id)} request={pending} onError={setError} onStop={stop} onReply={async (response) => { await Desktop.respond(text(pending.id), response); setConversation((current) => ({ ...current, pending: current.pending.filter((item) => item.id !== pending.id) })); }} />}
+    {pending && <ExtensionDialog key={text(pending.id)} request={pending} onError={setError} onStop={stop} onReply={async (response) => { await Desktop.respond(text(pending.id), response); setConversation((current) => ({ ...current, pending: current.pending.filter((item) => item.id !== pending.id) })); }} />}
   </div>;
 }
